@@ -1,9 +1,11 @@
 import crypto from "crypto";
 import type { Express, Request, Response } from "express";
-import { getSyncSource, markSourceSynced, NormalizedLedgerRow, saveGoogleTokens } from "./db";
+import { getSyncSource, markSourceSynced, NormalizedLedgerRow, saveGoogleTokens, upsertUser, getUserByOpenId } from "./db";
 import { sdk } from "./_core/sdk";
+import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
+import { getSessionCookieOptions } from "./_core/cookies";
 
-const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly";
+const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const oauthSecret = () => crypto.createHash("sha256").update(process.env.JWT_SECRET || "development-only-secret").digest();
 const encode = (value: string) => Buffer.from(value).toString("base64url");
 const decode = (value: string) => Buffer.from(value, "base64url").toString("utf8");
@@ -40,6 +42,23 @@ export function readGoogleState(state: string) {
   return { userId: Number(userId), sourceId: Number(sourceId) };
 }
 
+export function createGoogleAuthState() {
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const payload = `${expiresAt}:${crypto.randomBytes(12).toString("hex")}`;
+  const signature = crypto.createHmac("sha256", oauthSecret()).update(payload).digest("base64url");
+  return `${encode(payload)}.${signature}`;
+}
+
+export function readGoogleAuthState(state: string) {
+  const [payloadValue, signature] = state.split(".");
+  if (!payloadValue || !signature) throw new Error("Invalid OAuth state");
+  const expected = crypto.createHmac("sha256", oauthSecret()).update(payloadValue).digest("base64url");
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error("OAuth state signature mismatch");
+  const [expiresAt, nonce] = payloadValue.split(":");
+  if (!expiresAt || !nonce || Number(expiresAt) < Date.now()) throw new Error("OAuth state expired");
+  return { nonce, expiresAt: Number(expiresAt) };
+}
+
 function redirectUri(req: Request) {
   if (process.env.GOOGLE_REDIRECT_URI) return process.env.GOOGLE_REDIRECT_URI;
   const host = req.get("host");
@@ -60,6 +79,12 @@ async function exchangeCode(req: Request, code: string) {
   const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri(req), grant_type: "authorization_code" }) });
   if (!response.ok) throw new Error(`Google token exchange failed (${response.status})`);
   return response.json() as Promise<{ access_token: string; refresh_token?: string; expires_in?: number }>;
+}
+
+async function getGoogleUserInfo(accessToken: string) {
+  const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!response.ok) throw new Error(`Google user info failed (${response.status})`);
+  return response.json() as Promise<{ sub?: string; email?: string | null; name?: string | null }>;
 }
 
 async function refreshAccessToken(source: { accessTokenEnc: string | null; refreshTokenEnc: string | null; tokenExpiresAt: number | null }) {
@@ -108,11 +133,16 @@ export function normalizeSheetMatrix(matrix: unknown[][], sourceName: string): N
 }
 
 export function registerGoogleSheetsRoutes(app: Express) {
-  app.get("/api/google/start", async (req, res) => {
+  app.get("/api/auth/google/start", async (req, res) => {
     try {
-      const sourceId = Number(req.query.sourceId);
+      const sourceId = Number(req.query.sourceId || 0);
+      if (!sourceId) {
+        const state = createGoogleAuthState();
+        res.redirect(buildGoogleAuthUrl(req, state));
+        return;
+      }
       const user = await sdk.authenticateRequest(req);
-      if (!user || !sourceId) return res.status(401).send("Sign in and choose a sync source first");
+      if (!user) return res.status(401).send("Sign in and choose a sync source first");
       const source = await getSyncSource(user.id, sourceId);
       if (!source) return res.status(404).send("Sync source not found");
       res.redirect(buildGoogleAuthUrl(req, createGoogleState(user.id, sourceId)));
@@ -121,9 +151,28 @@ export function registerGoogleSheetsRoutes(app: Express) {
 
   app.get("/api/google/callback", async (req: Request, res: Response) => {
     try {
+      const sourceId = Number(req.query.sourceId || 0);
       const state = readGoogleState(String(req.query.state || ""));
       const code = String(req.query.code || "");
       if (!code) return res.status(400).send("Google authorization code missing");
+      if (!sourceId) {
+        const authState = readGoogleAuthState(String(req.query.state || ""));
+        const token = await exchangeCode(req, code);
+        const googleUser = await getGoogleUserInfo(token.access_token);
+        const userRecord = await upsertUser({
+          openId: googleUser.sub ?? "",
+          name: googleUser.name ?? null,
+          email: googleUser.email ?? null,
+          loginMethod: "google",
+          lastSignedIn: new Date(),
+        });
+        const user = await getUserByOpenId(googleUser.sub ?? "");
+        const sessionToken = await sdk.createSessionToken(user?.openId ?? googleUser.sub ?? "", { name: googleUser.name || "", expiresInMs: ONE_YEAR_MS });
+        const cookieOptions = getSessionCookieOptions(req);
+        res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
+        res.redirect("/");
+        return;
+      }
       const source = await getSyncSource(state.userId, state.sourceId);
       if (!source) return res.status(404).send("Sync source not found");
       const token = await exchangeCode(req, code);
