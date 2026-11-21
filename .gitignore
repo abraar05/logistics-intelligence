@@ -106,6 +106,9 @@ temp/
 *.sqlite
 *.sqlite3
 
+# Local credential attachments
+.andcode-attachments/
+
 # Webdev artifacts (checkpoint zips, migrations, etc.)
 .webdev/
 
