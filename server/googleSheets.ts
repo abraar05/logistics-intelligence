@@ -52,9 +52,10 @@ export function createGoogleAuthState() {
 export function readGoogleAuthState(state: string) {
   const [payloadValue, signature] = state.split(".");
   if (!payloadValue || !signature) throw new Error("Invalid OAuth state");
-  const expected = crypto.createHmac("sha256", oauthSecret()).update(payloadValue).digest("base64url");
+  const payload = decode(payloadValue);
+  const expected = crypto.createHmac("sha256", oauthSecret()).update(payload).digest("base64url");
   if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error("OAuth state signature mismatch");
-  const [expiresAt, nonce] = payloadValue.split(":");
+  const [expiresAt, nonce] = payload.split(":");
   if (!expiresAt || !nonce || Number(expiresAt) < Date.now()) throw new Error("OAuth state expired");
   return { nonce, expiresAt: Number(expiresAt) };
 }
@@ -152,7 +153,6 @@ export function registerGoogleSheetsRoutes(app: Express) {
   app.get("/api/google/callback", async (req: Request, res: Response) => {
     try {
       const sourceId = Number(req.query.sourceId || 0);
-      const state = readGoogleState(String(req.query.state || ""));
       const code = String(req.query.code || "");
       if (!code) return res.status(400).send("Google authorization code missing");
       if (!sourceId) {
@@ -173,6 +173,7 @@ export function registerGoogleSheetsRoutes(app: Express) {
         res.redirect("/");
         return;
       }
+      const state = readGoogleState(String(req.query.state || ""));
       const source = await getSyncSource(state.userId, state.sourceId);
       if (!source) return res.status(404).send("Sync source not found");
       const token = await exchangeCode(req, code);

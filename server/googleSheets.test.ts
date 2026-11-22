@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createGoogleState, decryptToken, encryptToken, normalizeSheetMatrix, readGoogleState } from "./googleSheets";
+import { createGoogleAuthState, createGoogleState, decryptToken, encryptToken, normalizeSheetMatrix, readGoogleAuthState, readGoogleState } from "./googleSheets";
 
 describe("google sheets adapter", () => {
   it("round-trips encrypted tokens without exposing plaintext", () => {
@@ -12,6 +12,13 @@ describe("google sheets adapter", () => {
   it("signs and reads state payloads", () => {
     const state = createGoogleState(7, 19);
     expect(readGoogleState(state)).toEqual({ userId: 7, sourceId: 19 });
+  });
+
+  it("signs and reads first-time Google auth state", () => {
+    const state = createGoogleAuthState();
+    const payload = readGoogleAuthState(state);
+    expect(payload.nonce).toBeTruthy();
+    expect(payload.expiresAt).toBeGreaterThan(Date.now());
   });
 
   it("normalizes an IMEI worksheet into ledger observations", () => {
